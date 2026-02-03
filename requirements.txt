@@ -1,0 +1,27 @@
+# AI Trading Bot Requirements
+
+# AI & LLM
+google-genai>=0.2.0
+
+# Trading & Market Data
+alpaca-py>=0.9.0
+yfinance>=0.2.40
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# News & Sentiment (optional, can add later)
+# newsapi-python>=0.2.7
+
+# Scheduling
+schedule>=1.2.0
+
+# API & Web
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-dotenv>=1.0.0
+
+# Utilities
+requests>=2.31.0
+python-dateutil>=2.8.2
