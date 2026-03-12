@@ -1,359 +1,351 @@
-#!/usr/bin/env python3
-"""
-Chinese Biotech News Scraper & Summarizer
-Fetches top articles from Chinese biotech sources, translates and summarizes using Gemini
-"""
-
-import os
-import json
-import time
-import smtplib
-import requests
-from datetime import datetime, date
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from bs4 import BeautifulSoup
 import google.generativeai as genai
+from datetime import datetime
+import json
+import re
+from typing import Dict, List, Optional
 
-# ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-EMAIL_SENDER   = os.environ["EMAIL_SENDER"]
-EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]   # Gmail App Password
-EMAIL_TO       = os.environ["EMAIL_TO"]
-SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+class GeminiTrader:
+    """AI trader powered by Google Gemini for market analysis and decision making"""
+    
+    def __init__(self, api_key: str, model_name: str = 'gemini-1.5-pro'):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(model_name)
+        self.model_name = model_name
+        print(f"✓ Gemini AI initialized ({model_name})")
+    
+    def analyze_and_decide(self, portfolio_state: Dict, market_data: Dict, 
+                          market_overview: Dict, earnings_calendar: List[Dict]) -> Dict:
+        """
+        Main analysis function - takes all market data and returns a trading decision
+        """
+        
+        # Build comprehensive prompt
+        prompt = self._build_analysis_prompt(
+            portfolio_state=portfolio_state,
+            market_data=market_data,
+            market_overview=market_overview,
+            earnings_calendar=earnings_calendar
+        )
+        
+        try:
+            # Get response from Gemini
+            response = self.model.generate_content(prompt)
+            
+            # Parse the decision
+            decision = self._parse_decision(response.text)
+            decision['timestamp'] = datetime.now().isoformat()
+            decision['model_used'] = self.model_name
+            
+            return decision
+            
+        except Exception as e:
+            print(f"Error in AI analysis: {e}")
+            return {
+                'action': 'HOLD',
+                'reasoning': f'Error in analysis: {str(e)}',
+                'confidence': 0,
+                'timestamp': datetime.now().isoformat()
+            }
+    
+    def _build_analysis_prompt(self, portfolio_state: Dict, market_data: Dict,
+                               market_overview: Dict, earnings_calendar: List[Dict]) -> str:
+        """Build comprehensive prompt for Gemini"""
+        
+        # Format portfolio positions
+        positions_text = self._format_positions(portfolio_state.get('positions', []))
+        
+        # Format market data for each stock
+        market_analysis = self._format_market_data(market_data)
+        
+        # Format earnings calendar
+        earnings_text = self._format_earnings_calendar(earnings_calendar)
+        
+        # Calculate days since start (estimate based on returns)
+        days_active = 1  # TODO: Track this properly
+        
+        prompt = f"""You are an elite AI portfolio manager managing a ${portfolio_state.get('total_value', 100000):,.0f} portfolio.
 
-TARGET_ARTICLES = 20
-SUMMARY_WORDS   = 200
+====================
+CURRENT PORTFOLIO STATE
+====================
+Total Value: ${portfolio_state.get('total_value', 0):,.2f}
+Cash Available: ${portfolio_state.get('cash', 0):,.2f} ({portfolio_state.get('cash_percentage', 0):.1f}%)
+Total Return: {portfolio_state.get('total_return', 0):+.2f}%
+Total P&L: ${portfolio_state.get('total_pl', 0):+,.2f}
+Number of Positions: {portfolio_state.get('position_count', 0)}
+Days Active: {days_active}
 
-# ── News Sources ──────────────────────────────────────────────────────────────
-SOURCES = [
-    {
-        "name": "36Kr Bio",
-        "url": "https://36kr.com/newsflashes",
-        "tag": "FierceBiotech-style",
-        "selector": "article.newsflash-item, .news-item, .article-item",
-        "rss": None,
-    },
-    {
-        "name": "Bioon",
-        "url": "https://www.bioon.com/",
-        "tag": "STAT-style",
-        "selector": ".article-list li, .news-list li, article",
-        "rss": None,
-    },
-    {
-        "name": "Yicai Global Biotech",
-        "url": "https://www.yicai.com/news/",
-        "tag": "BioPharma-style",
-        "selector": ".news-list li, .article-item",
-        "rss": None,
-    },
-    {
-        "name": "Drugdu",
-        "url": "https://www.drugdu.com/",
-        "tag": "Regulatory/Pipeline",
-        "selector": ".news-list li, .item",
-        "rss": None,
-    },
-    {
-        "name": "PharmCube",
-        "url": "https://www.pharmcube.com/information/news",
-        "tag": "Deals/Policy",
-        "selector": ".news-item, article, .list-item",
-        "rss": None,
-    },
-    {
-        "name": "BioValley",
-        "url": "https://www.bioon.com/topic/",
-        "tag": "General Biotech",
-        "selector": "tr, .news-item, li",
-        "rss": None,
-    },
-    {
-        "name": "CN Pharma News",
-        "url": "https://www.cn-healthcare.com/articlewm/",
-        "tag": "Healthcare/Pharma",
-        "selector": ".article-list li, .news-item",
-        "rss": None,
-    },
-    {
-        "name": "MedCity (CN)",
-        "url": "https://vcbeat.top/",
-        "tag": "VC/Startup",
-        "selector": ".post-list li, article, .news-item",
-        "rss": None,
-    },
-]
+CURRENT POSITIONS:
+{positions_text}
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-}
+====================
+MARKET CONDITIONS
+====================
+S&P 500: ${market_overview.get('spy_price', 0):.2f} ({market_overview.get('spy_change', 0):+.2f}%)
+1-Month SPY Return: {market_overview.get('spy_1m_return', 0):+.2f}%
+VIX (Volatility): {market_overview.get('vix', 0):.2f}
+Market Sentiment: {market_overview.get('market_sentiment', 'Unknown')}
 
+====================
+DETAILED STOCK ANALYSIS
+====================
+{market_analysis}
 
-# ── Scraping ──────────────────────────────────────────────────────────────────
-def fetch_page(url: str, timeout: int = 15) -> BeautifulSoup | None:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        r.encoding = r.apparent_encoding or "utf-8"
-        return BeautifulSoup(r.text, "html.parser")
-    except Exception as e:
-        print(f"  ⚠ Could not fetch {url}: {e}")
-        return None
+====================
+UPCOMING EARNINGS
+====================
+{earnings_text}
 
+====================
+YOUR TASK
+====================
+Analyze all available data and make ONE of the following decisions:
 
-def extract_links_generic(soup: BeautifulSoup, base_url: str) -> list[dict]:
-    """Generic link extraction – grab <a> tags with meaningful text."""
-    articles = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        text = a.get_text(strip=True)
-        href = a["href"]
-        if len(text) < 10:
-            continue
-        # Skip nav / pagination links
-        skip_kw = ["登录", "注册", "首页", "更多", "返回", "关于", "联系", "广告"]
-        if any(k in text for k in skip_kw):
-            continue
-        # Resolve relative URLs
-        if href.startswith("/"):
-            from urllib.parse import urlparse
-            parsed = urlparse(base_url)
-            href = f"{parsed.scheme}://{parsed.netloc}{href}"
-        elif not href.startswith("http"):
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
-        articles.append({"title": text, "url": href, "snippet": ""})
-    return articles
+1. **BUY** - Purchase shares of a specific stock
+2. **SELL** - Sell shares of a current position
+3. **HOLD** - Maintain current positions (no trades)
 
+DECISION CRITERIA:
+- Consider technical indicators (price momentum, volume, volatility)
+- Evaluate fundamentals (PE ratios, growth rates, margins)
+- Assess news sentiment and upcoming catalysts
+- Manage risk through diversification and position sizing
+- Time trades around earnings and major events
+- Compare expected returns vs. current positions
 
-def scrape_source(source: dict) -> list[dict]:
-    print(f"  Scraping {source['name']} …")
-    soup = fetch_page(source["url"])
-    if not soup:
-        return []
-    articles = extract_links_generic(soup, source["url"])
-    # Tag each article with its source
-    for a in articles:
-        a["source"] = source["name"]
-        a["source_tag"] = source["tag"]
-    return articles[:15]  # max 15 per source before dedup
+RISK MANAGEMENT:
+- Maximum position size: 15% of portfolio
+- Target 6-10 positions for diversification
+- Consider correlation between holdings
+- Avoid over-concentration in single sector
+- Maintain 10-20% cash for opportunities
 
+====================
+OUTPUT FORMAT (CRITICAL - FOLLOW EXACTLY)
+====================
+Decision: [BUY/SELL/HOLD]
+Symbol: [TICKER if BUY/SELL, otherwise N/A]
+Quantity: [Number of shares if BUY/SELL, otherwise N/A]
+Confidence: [1-10, where 10 is highest confidence]
 
-def get_article_body(url: str) -> str:
-    """Try to pull the main article text."""
-    soup = fetch_page(url, timeout=20)
-    if not soup:
-        return ""
-    # Remove scripts/styles
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    # Prefer <article> or main content divs
-    for sel in ["article", "main", ".article-content", ".content", ".post-content", "#content"]:
-        block = soup.select_one(sel)
-        if block:
-            return block.get_text(separator="\n", strip=True)[:3000]
-    return soup.get_text(separator="\n", strip=True)[:3000]
+Analysis:
+[Write 250-400 words explaining your reasoning. Be specific with data points. Reference actual numbers from the data provided. Explain your conviction and what you're watching for. Write in first person as the portfolio manager.]
 
+Key Catalysts:
+- [List 3-5 upcoming events or factors driving your decision]
 
-# ── Gemini ────────────────────────────────────────────────────────────────────
-def setup_gemini():
-    genai.configure(api_key=GEMINI_API_KEY)
-    return genai.GenerativeModel("gemini-1.5-flash")
+Risk Factors:
+- [List 3-5 risks you're monitoring]
 
+====================
+EXAMPLE OUTPUT (for reference only)
+====================
+Decision: HOLD
+Symbol: N/A
+Quantity: N/A
+Confidence: 8
 
-def score_and_select(model, raw_articles: list[dict]) -> list[dict]:
-    """Ask Gemini to pick the top 20 most newsworthy biotech articles."""
-    titles_json = json.dumps(
-        [{"i": i, "title": a["title"], "source": a["source"]} for i, a in enumerate(raw_articles)],
-        ensure_ascii=False,
-    )
-    prompt = f"""You are a biotech editor. From the list below, pick the {TARGET_ARTICLES} most 
-newsworthy Chinese biotech articles published today. Prioritize: clinical trials, drug approvals, 
-funding rounds, licensing deals, regulatory changes, and scientific breakthroughs.
+Analysis:
+Holding all 6 positions steady ahead of critical earnings week. Portfolio at $107,880 (+7.9%) with strong momentum across tech holdings. MSFT reports tomorrow after close with Azure expected at 37% growth - this is a key catalyst for my 11.6% position. The stock has held $420 support well and analyst consensus is $465 (+8% upside). AMD and GOOGL both report next week (Feb 3-4), representing another 45% of my portfolio. AMD's MI300 AI chip ramp is the focus, with datacenter revenue expected up 25% QoQ. 
 
-Return ONLY a JSON array of the selected indices (e.g. [0, 3, 7, ...]).
+With 88% deployed and three major binary events in the next 8 days, the disciplined move is letting these quality positions run through their earnings catalysts rather than making changes for activity's sake. Market conditions are supportive with Fed on pause and AI infrastructure spend accelerating. VIX at 14 shows low volatility, and the S&P is holding above key 20-day MA support. 
 
-Articles:
-{titles_json}
+My positions are relatively young (avg 28 days hold) and fundamentally sound. NVDA continues to benefit from H100/H200 demand. Will reassess after this earnings wave passes and look to add 1-2 new positions if cash builds above 20%. Watching for any GOOGL weakness pre-earnings as a potential add opportunity.
+
+Key Catalysts:
+- MSFT earnings (tomorrow AH) - Azure growth is key metric
+- AMD earnings (Feb 3) - MI300 datacenter ramp crucial  
+- GOOGL earnings (Feb 4) - Cloud margin expansion expected
+- Fed commentary - Powell speaks Friday on economic outlook
+- Semiconductor sector rotation - watching for broadening beyond NVDA
+
+Risk Factors:
+- Earnings disappointment risk with 60% of portfolio reporting next week
+- Tech sector concentration - need to add diversification
+- Market overbought on short-term - watching for 3-5% pullback
+- Rising yields could pressure growth stock multiples
+- Geopolitical tensions (China-Taiwan) affecting chip stocks
+
+NOW PROVIDE YOUR ACTUAL ANALYSIS AND DECISION:
 """
-    try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
-        # Extract JSON array
-        start, end = text.find("["), text.rfind("]")
-        indices = json.loads(text[start : end + 1])
-        return [raw_articles[i] for i in indices if i < len(raw_articles)]
-    except Exception as e:
-        print(f"  ⚠ Gemini selection failed: {e} — using first {TARGET_ARTICLES}")
-        return raw_articles[:TARGET_ARTICLES]
-
-
-def translate_and_summarize(model, article: dict, body: str) -> str:
-    """Translate title + body into a ~200-word English summary."""
-    content_for_prompt = body if body else article["title"]
-    prompt = f"""You are a bilingual (Chinese→English) biotech journalist.
-
-Translate and summarize the following Chinese biotech article in exactly ~{SUMMARY_WORDS} English words.
-Structure: 1-sentence headline summary, then the key facts (who, what, drug/target, stage, deal terms if any, significance).
-Be precise and factual. Do NOT pad with generic statements.
-
-Source: {article['source']} ({article['source_tag']})
-Title: {article['title']}
-URL: {article['url']}
-
-Article content:
-{content_for_prompt}
+        
+        return prompt
+    
+    def _format_positions(self, positions: List[Dict]) -> str:
+        """Format current positions for display"""
+        if not positions:
+            return "No current positions (100% cash)"
+        
+        text = ""
+        for pos in positions:
+            pct_of_portfolio = 0  # Calculate this if needed
+            text += f"""
+{pos['symbol']}: {pos['quantity']} shares @ ${pos['avg_entry_price']:.2f}
+  Current: ${pos['current_price']:.2f} | P&L: ${pos['unrealized_pl']:+,.2f} ({pos['unrealized_plpc']:+.2f}%)
+  Market Value: ${pos['market_value']:,.2f}
 """
-    try:
-        resp = model.generate_content(prompt)
-        return resp.text.strip()
-    except Exception as e:
-        return f"[Summary unavailable: {e}]"
+        return text.strip()
+    
+    def _format_market_data(self, market_data: Dict) -> str:
+        """Format market data for all stocks in watchlist"""
+        if not market_data:
+            return "No market data available"
+        
+        text = ""
+        for symbol, data in market_data.items():
+            if 'error' in data:
+                continue
+            
+            perf = data.get('recent_performance', {})
+            fundamentals = data.get('fundamentals', {})
+            news = data.get('news', [])
+            
+            text += f"""
+--- {symbol} ({data.get('sector', 'Unknown')} / {data.get('industry', 'Unknown')}) ---
+Price: ${data.get('current_price', 0):.2f} | Day Range: ${data.get('day_low', 0):.2f} - ${data.get('day_high', 0):.2f}
+Performance: 1D {perf.get('1_day', 0):+.2f}% | 5D {perf.get('5_day', 0):+.2f}% | 1M {perf.get('1_month', 0):+.2f}%
+Volume: {data.get('volume', 0):,} (Avg: {data.get('avg_volume', 0):,})
+Volatility: {perf.get('volatility', 0):.2f}%
 
+Valuation:
+  P/E: {data.get('pe_ratio', 0):.1f} | Forward P/E: {data.get('forward_pe', 0):.1f}
+  Market Cap: ${data.get('market_cap', 0)/1e9:.1f}B
+  52-Week Range: ${data.get('52_week_low', 0):.2f} - ${data.get('52_week_high', 0):.2f}
+  Beta: {data.get('beta', 0):.2f}
 
-# ── Email ─────────────────────────────────────────────────────────────────────
-def build_html_email(articles_with_summaries: list[dict]) -> str:
-    today = date.today().strftime("%B %d, %Y")
-    rows = ""
-    for i, art in enumerate(articles_with_summaries, 1):
-        rows += f"""
-        <tr>
-          <td style="padding:20px 0; border-bottom:1px solid #e8e8e8;">
-            <p style="margin:0 0 4px 0; font-size:12px; color:#888; text-transform:uppercase; letter-spacing:1px;">
-              {i:02d} &nbsp;·&nbsp; {art['source']} &nbsp;·&nbsp; {art['source_tag']}
-            </p>
-            <h2 style="margin:0 0 10px 0; font-size:17px; color:#1a1a2e; line-height:1.4;">
-              <a href="{art['url']}" style="color:#1a1a2e; text-decoration:none;">{art['title']}</a>
-            </h2>
-            <p style="margin:0 0 10px 0; font-size:14px; color:#333; line-height:1.7;">
-              {art['summary']}
-            </p>
-            <a href="{art['url']}" style="font-size:13px; color:#2563eb;">Read original →</a>
-          </td>
-        </tr>"""
+Fundamentals:
+  Revenue Growth: {fundamentals.get('revenue_growth', 0)*100:.1f}%
+  Earnings Growth: {fundamentals.get('earnings_growth', 0)*100:.1f}%
+  Profit Margin: {fundamentals.get('profit_margins', 0)*100:.1f}%
+  ROE: {fundamentals.get('roe', 0)*100:.1f}%
+  EPS: ${fundamentals.get('eps', 0):.2f} (Fwd: ${fundamentals.get('forward_eps', 0):.2f})
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#f4f6f9;font-family:'Segoe UI',Arial,sans-serif;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:30px 0;">
-    <tr><td align="center">
-      <table width="680" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08);">
+Analyst Rating: {data.get('recommendation', 'N/A').upper()} | Target: ${data.get('target_price', 0):.2f}
 
-        <!-- Header -->
-        <tr>
-          <td style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%);padding:32px 40px;">
-            <p style="margin:0 0 6px 0;font-size:11px;color:#7ec8e3;letter-spacing:2px;text-transform:uppercase;">Daily Intelligence Report</p>
-            <h1 style="margin:0;font-size:26px;color:#fff;font-weight:700;">🧬 China Biotech News</h1>
-            <p style="margin:8px 0 0 0;font-size:14px;color:#a0b4c8;">{today} &nbsp;·&nbsp; Top {TARGET_ARTICLES} Stories</p>
-          </td>
-        </tr>
+Recent News:
+"""
+            # Add top 3 news items
+            for i, item in enumerate(news[:3], 1):
+                text += f"  {i}. {item.get('title', 'N/A')} ({item.get('publisher', 'Unknown')})\n"
+            
+            text += "\n"
+        
+        return text.strip()
+    
+    def _format_earnings_calendar(self, calendar: List[Dict]) -> str:
+        """Format earnings calendar"""
+        if not calendar:
+            return "No upcoming earnings in current positions"
+        
+        text = "Upcoming Earnings:\n"
+        for item in calendar:
+            text += f"  - {item['symbol']} ({item.get('company', 'Unknown')}): {item.get('earnings_date', 'TBD')}\n"
+        
+        return text.strip()
+    
+    def _parse_decision(self, response_text: str) -> Dict:
+        """Parse Gemini's response into structured decision"""
+        
+        decision = {
+            'action': 'HOLD',
+            'symbol': None,
+            'quantity': None,
+            'confidence': 5,
+            'reasoning': response_text,
+            'key_catalysts': [],
+            'risk_factors': []
+        }
+        
+        # Extract decision
+        decision_match = re.search(r'Decision:\s*(BUY|SELL|HOLD)', response_text, re.IGNORECASE)
+        if decision_match:
+            decision['action'] = decision_match.group(1).upper()
+        
+        # Extract symbol
+        symbol_match = re.search(r'Symbol:\s*([A-Z]{1,5})', response_text)
+        if symbol_match:
+            decision['symbol'] = symbol_match.group(1).upper()
+        
+        # Extract quantity
+        quantity_match = re.search(r'Quantity:\s*(\d+)', response_text)
+        if quantity_match:
+            decision['quantity'] = int(quantity_match.group(1))
+        
+        # Extract confidence
+        confidence_match = re.search(r'Confidence:\s*(\d+)', response_text)
+        if confidence_match:
+            decision['confidence'] = int(confidence_match.group(1))
+        
+        # Extract key catalysts
+        catalysts_section = re.search(r'Key Catalysts:(.*?)(?:Risk Factors:|$)', response_text, re.DOTALL)
+        if catalysts_section:
+            catalysts = re.findall(r'-\s*(.+)', catalysts_section.group(1))
+            decision['key_catalysts'] = [c.strip() for c in catalysts]
+        
+        # Extract risk factors
+        risks_section = re.search(r'Risk Factors:(.*?)$', response_text, re.DOTALL)
+        if risks_section:
+            risks = re.findall(r'-\s*(.+)', risks_section.group(1))
+            decision['risk_factors'] = [r.strip() for r in risks]
+        
+        return decision
+    
+    def generate_daily_summary(self, portfolio_state: Dict, recent_decisions: List[Dict]) -> str:
+        """Generate a narrative summary of current strategy"""
+        
+        prompt = f"""Generate a concise 3-4 sentence trading plan summary for today.
 
-        <!-- Content -->
-        <tr>
-          <td style="padding:10px 40px 30px 40px;">
-            <table width="100%" cellpadding="0" cellspacing="0">
-              {rows}
-            </table>
-          </td>
-        </tr>
+Portfolio Status:
+- Value: ${portfolio_state.get('total_value', 0):,.0f}
+- Return: {portfolio_state.get('total_return', 0):+.2f}%
+- Positions: {portfolio_state.get('position_count', 0)}
+- Cash: ${portfolio_state.get('cash', 0):,.0f} ({portfolio_state.get('cash_percentage', 0):.1f}%)
 
-        <!-- Footer -->
-        <tr>
-          <td style="background:#f8fafc;padding:20px 40px;border-top:1px solid #e8e8e8;">
-            <p style="margin:0;font-size:12px;color:#999;text-align:center;">
-              Translated &amp; summarized by Gemini AI &nbsp;·&nbsp; Sources: 36Kr Bio, Bioon, Yicai, Drugdu, PharmCube &amp; more<br>
-              Delivered daily at 7:00 AM PST via GitHub Actions
-            </p>
-          </td>
-        </tr>
+Recent Activity:
+{self._format_recent_activity(recent_decisions)}
 
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+Write a professional, concise summary similar to:
+"Holding all positions steady ahead of earnings. Portfolio at $107,880 (+7.9%) with MSFT reporting tomorrow..."
 
-
-def send_email(html_body: str, article_count: int):
-    today = date.today().strftime("%b %d, %Y")
-    subject = f"🧬 China Biotech Daily — {article_count} Stories | {today}"
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_SENDER
-    msg["To"]      = EMAIL_TO
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, EMAIL_TO.split(","), msg.as_string())
-    print(f"✅ Email sent to {EMAIL_TO}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    print(f"\n{'='*60}")
-    print(f"China Biotech News — {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"{'='*60}")
-
-    # 1. Scrape all sources
-    print("\n[1/4] Scraping sources …")
-    raw_articles = []
-    for source in SOURCES:
-        articles = scrape_source(source)
-        print(f"      {source['name']}: {len(articles)} articles found")
-        raw_articles.extend(articles)
-        time.sleep(1.5)  # polite crawl delay
-
-    print(f"  Total raw articles: {len(raw_articles)}")
-    if not raw_articles:
-        print("⚠ No articles found. Exiting.")
-        return
-
-    # 2. Deduplicate by URL
-    seen_urls = set()
-    deduped = []
-    for a in raw_articles:
-        if a["url"] not in seen_urls:
-            seen_urls.add(a["url"])
-            deduped.append(a)
-    print(f"  After dedup: {len(deduped)} articles")
-
-    # 3. Let Gemini select the top 20
-    print("\n[2/4] Selecting top articles with Gemini …")
-    model = setup_gemini()
-    top_articles = score_and_select(model, deduped)
-    print(f"  Selected: {len(top_articles)} articles")
-
-    # 4. Fetch bodies + summarize
-    print("\n[3/4] Fetching bodies & generating summaries …")
-    results = []
-    for i, art in enumerate(top_articles, 1):
-        print(f"  [{i}/{len(top_articles)}] {art['title'][:60]} …")
-        body = get_article_body(art["url"])
-        summary = translate_and_summarize(model, art, body)
-        art["summary"] = summary
-        results.append(art)
-        time.sleep(1)  # rate limit buffer
-
-    # 5. Send email
-    print("\n[4/4] Sending email …")
-    html = build_html_email(results)
-    send_email(html, len(results))
-    print("\nDone! 🎉")
-
+Focus on: current strategy, upcoming catalysts, reasoning for holds/trades.
+"""
+        
+        try:
+            response = self.model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            return f"Portfolio update: ${portfolio_state.get('total_value', 0):,.0f} ({portfolio_state.get('total_return', 0):+.2f}%)"
+    
+    def _format_recent_activity(self, decisions: List[Dict]) -> str:
+        """Format recent decisions"""
+        if not decisions:
+            return "No recent activity"
+        
+        # Filter out None values
+        valid_decisions = [d for d in decisions if d is not None]
+        
+        if not valid_decisions:
+            return "No recent activity"
+        
+        text = ""
+        for decision in valid_decisions[-5:]:  # Last 5 decisions
+            text += f"- {decision.get('timestamp', 'Unknown')}: {decision.get('action', 'HOLD')}"
+            if decision.get('symbol'):
+                text += f" {decision['symbol']}"
+            text += "\n"
+        
+        return text.strip()
 
 if __name__ == "__main__":
-    main()
+    # Test Gemini trader
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv()
+    api_key = os.getenv('GOOGLE_API_KEY', '')
+    
+    if api_key:
+        trader = GeminiTrader(api_key)
+        print("✓ Gemini trader ready for analysis")
+    else:
+        print("⚠ Please set GOOGLE_API_KEY in .env file")
